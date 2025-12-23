@@ -1,64 +1,87 @@
 # SenTrack
 
-SenTrack is a Python-based tool for live-cell assessment of cellular senescence using lysosomal profiling. It performs single-cell image analysis from DAPI and LysoTracker images, with optional SA-β-Gal–based training, validation, and quality control workflows.
+SenTrack is a Python tool for live-cell assessment of cellular senescence using lysosomal profiling. It performs single-cell image analysis from DAPI and LysoTracker images, with optional SA-β-Gal support for training, validation, and QC workflows.
 
-## Quick start
+## What’s in this repo
 
-SenTrack provides two versions:
+### SenTrackLite (GUI, analysis-only)
+A lightweight, user-guided segmentation and measurement app for quick senescence assessment and figure-ready outputs.
 
-- **SenTrack Lite** – streamlined, GUI-based analysis for rapid senescence assessment
-- **SenTrack (full)** – extended tools for model training, parameter fine-tuning, and quality control
-
-This repository currently focuses on **SenTrack Lite**, which is sufficient for most experimental analyses.
+### SenTrack (full pipeline)
+A more comprehensive toolkit intended for training, fine-tuning parameters, validation, and additional QC utilities.
 
 ## Requirements
-
-- Python 3.9 or newer  
-- macOS, Linux, or Windows  
-- Fluorescence imaging data (DAPI + LysoTracker; SA-β-Gal optional)
+- Python 3.9+ (recommended: 3.10 or 3.11)
+- macOS, Linux, or Windows
+- Imaging inputs: DAPI + LysoTracker (SA-β-Gal optional)
 
 ## Installation
 
-Clone the repository and install dependencies:
-
-```bash
+1) Clone the repo
+```
 git clone https://github.com/goldbader-hub/SenTrack.git
 cd SenTrack
+```
+
+2) Create and activate a virtual environment (recommended)
+
+macOS / Linux
+```
+python -m venv .venv
+source .venv/bin/activate
+```
+
+Windows (PowerShell)
+```
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+3) Install dependencies
+```
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+```
 
-Running SenTrack Lite (analysis only)
+Optional (only needed for some compressed TIFFs like LZW)
+```
+pip install imagecodecs
+```
 
-The Lite version is designed for fast, user-guided analysis and visualization.
+## Quick start
 
+### Run SenTrackLite (GUI)
+```
 python SenTrackLite.py
+```
 
-This launches a graphical interface that allows:
-	•	Manual selection of DAPI, LysoTracker, and optional SA-β-Gal images
-	•	Live preview of nuclei, cell, lysosomal, and SA-β-Gal segmentation
-	•	Interactive adjustment of thresholding and segmentation parameters
-	•	Export of per-cell measurements, masks, and summary figures
+In the GUI you can:
+- Select DAPI, LysoTracker, and optional SA-β-Gal images manually
+- Live-preview segmentation and masks
+- Adjust thresholds and segmentation parameters
+- Export per-cell measurements, masks, and preview figures
 
-Output
+### Run the full SenTrack pipeline (CLI)
+If this repo includes a CLI script (for example `Sentrackfigures.py`), you can check available commands with:
+```
+python Sentrackfigures.py --help
+```
 
-SenTrack Lite generates:
-	•	Per-cell CSV files containing lysosomal features
-	•	Segmentation masks for nuclei, cells, lysosomes, and SA-β-Gal signal
-	•	Preview figures suitable for downstream analysis and visualization
+## Outputs (SenTrackLite)
+SenTrackLite can export:
+- Per-cell CSV with lysosomal features
+- Segmentation masks (nuclei, cells, lysosomes, optional SA-β-Gal mask)
+- Preview PNG suitable for figures and QC
 
-SenTrack (full version)
+## Notes on TIFF compatibility
+Some microscope TIFFs are compressed (often LZW). If loading fails with an error mentioning `imagecodecs`, install:
+```
+pip install imagecodecs
+```
+If you prefer not to install extra codecs, convert TIFFs to uncompressed in Fiji/ImageJ (Save As TIFF with Compression: None).
 
-The full SenTrack framework extends beyond analysis to include:
-	•	Classifier training using SA-β-Gal–labeled ground truth
-	•	Feature selection and model evaluation
-	•	Analysis quality-control tools
-	•	Batch processing across experiments and plates
+## License
+MIT License (see `LICENSE`).
 
-These components are described in detail in the accompanying manuscript and will be released separately.
-
-License
-
-This project is released under the MIT License.
-- Create a **minimal `requirements.txt`** for SenTrack Lite  
-- Help you write the **short GitHub description (≤350 chars)**
-
-You’re doing this exactly right.
+## Citation
+If you use SenTrack in academic work, please cite the accompanying paper.
