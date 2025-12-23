@@ -17,3 +17,41 @@ Clone the repository and install the required dependencies:
 git clone https://github.com/YOUR_USERNAME/SenTrack.git
 cd SenTrack
 pip install -r requirements.txt
+
+## Quick start
+
+SenTrack is a Python-based tool for live-cell lysosomal senescence analysis using fluorescence imaging.
+
+### Requirements
+- Python 3.9 or newer
+- macOS, Linux, or Windows
+- A standard fluorescence imaging dataset (DAPI + LysoTracker; SA-β-Gal optional)
+
+### Installation
+Clone the repository and install the required dependencies:
+
+```bash
+git clone https://github.com/YOUR_USERNAME/SenTrack.git
+cd SenTrack
+pip install -r requirements.txt
+
+Running SenTrack Lite (analysis only)
+
+The Lite version is designed for fast, user-guided analysis and visualization.
+
+python SenTrackLite.py
+
+This launches a graphical interface that allows:
+	•	Manual selection of DAPI, LysoTracker, and optional SA-β-Gal images
+	•	Live preview of segmentation and masks
+	•	Adjustment of thresholding and segmentation parameters
+	•	Export of per-cell measurements, masks, and summary figures
+
+Output
+
+SenTrack Lite generates:
+	•	Per-cell CSV files with lysosomal features
+	•	Segmentation masks (nuclei, cells, lysosomes, SA-β-Gal)
+	•	Preview figures suitable for downstream analysis
+
+For advanced model training, classifier development, and quality-control tools, see the full SenTrack version.
