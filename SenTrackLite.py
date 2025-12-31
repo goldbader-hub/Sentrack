@@ -14,6 +14,10 @@ from typing import Optional, Tuple
 import tifffile as tiff
 from skimage import filters, measure, util
 from skimage.segmentation import find_boundaries
+from skimage.feature import peak_local_max
+
+APP_NAME = "SenTrackLite"
+APP_VERSION = "0.3.0"
 
 @dataclass
 class Config:
@@ -165,10 +169,24 @@ def segment_nuclei(d01: np.ndarray, cfg: Config) -> np.ndarray:
     bw = morphology.binary_closing(bw, morphology.disk(2))
 
     dist = ndi.distance_transform_edt(bw)
-    # Use a minimum distance between peaks
-    coords = morphology.local_maxima(dist)
-    # Label maxima as markers
-    markers = measure.label(coords)
+
+    md = int(max(1, getattr(cfg, "nuc_min_dist", 10)))
+    peaks = peak_local_max(
+        dist,
+        labels=bw.astype(np.uint8),
+        min_distance=md,
+        exclude_border=False,
+    )
+
+    markers = np.zeros_like(dist, dtype=np.int32)
+    if peaks.size > 0:
+        for i, (rr, cc) in enumerate(peaks, start=1):
+            markers[int(rr), int(cc)] = i
+    else:
+        # Fallback: single marker at the global max of dist
+        rr, cc = np.unravel_index(int(np.argmax(dist)), dist.shape)
+        markers[int(rr), int(cc)] = 1
+
     lab = segmentation.watershed(-dist, markers=markers, mask=bw)
     lab = morphology.remove_small_objects(lab, min_size=int(cfg.nuc_min_area))
     # Relabel to 1..N
@@ -295,19 +313,11 @@ def make_cell_masks(nuclei: np.ndarray, l01: np.ndarray, cfg: Config, d01: np.nd
 
     # Method 1 (existing): nucleus expansion
     if method == "expand":
-        se = morphology.disk(int(cfg.cell_expand))
-        cells = morphology.dilation(nuclei > 0, se)
-        # Convert to labels: propagate nucleus IDs into expanded regions
-        # Start with empty label image
-        out = np.zeros_like(nuclei, dtype=np.int32)
-        # For each nucleus label, dilate that nucleus and write the label
-        for lab in range(1, int(nuclei.max()) + 1):
-            m = nuclei == lab
-            if not np.any(m):
-                continue
-            dm = morphology.dilation(m, se)
-            out[dm & (out == 0)] = lab
-        # Optionally constrain to foreground
+        dist = int(max(0, round(float(cfg.cell_expand))))
+        if dist == 0:
+            out = nuclei.astype(np.int32)
+        else:
+            out = segmentation.expand_labels(nuclei.astype(np.int32), distance=dist).astype(np.int32)
         out[~fg] = 0
         return out
 
@@ -326,7 +336,7 @@ def make_cell_masks(nuclei: np.ndarray, l01: np.ndarray, cfg: Config, d01: np.nd
     raise ValueError(f"Unknown cell_mask_method: {cfg.cell_mask_method}. Use 'expand' or 'watershed'.")
 
 
-# --- Figure 3 (A,C) helper functions ---
+# --- Optional assist-plot helper functions (hidden in UI) ---
 
 def _read_per_cell_csv(csv_path: Path):
     """Read a per-cell CSV into a list of dicts (avoid pandas dependency)."""
@@ -462,25 +472,27 @@ def _sem(x: np.ndarray) -> float:
     return float(np.std(x, ddof=1) / np.sqrt(x.size))
 
 
-def make_figure3_ac(
+def make_assist_plots(
     out_png: Path,
-    low_folder: Path,
-    high_folder: Path,
+    folder_a: Path,
+    folder_b: Path,
     plate_folder: Path,
     feature_col: str = "lyso_mean",
     burden_mode: str = "auto",
     prob_threshold: float = 0.5,
 ):
-    """Create Figure 3 panels A and C as a single PNG.
+    """Create optional QC/summary plots as a single PNG.
 
-    Panel A: distribution of per-cell feature values for low vs high condition.
-    Panel C: per-group (condition) senescence burden from a folder of per-well CSVs.
+    Left: distribution of per-cell feature values for two folders of per-cell CSVs.
+    Right: per-group senescence burden from a folder of per-well per-cell CSVs.
+
+    This tool is intentionally generic and hidden behind a small UI affordance.
     """
-    # --- Panel A data
-    low_vals, _ = load_folder_feature_values(Path(low_folder), feature_col)
-    high_vals, _ = load_folder_feature_values(Path(high_folder), feature_col)
+    # --- Distribution plot data
+    low_vals, _ = load_folder_feature_values(Path(folder_a), feature_col)
+    high_vals, _ = load_folder_feature_values(Path(folder_b), feature_col)
 
-    # --- Panel C data
+    # --- Burden summary data
     _, per_file = load_folder_feature_values(Path(plate_folder), feature_col)
 
     # Decide burden mode
@@ -511,7 +523,7 @@ def make_figure3_ac(
     group_means = [float(np.mean(groups[g])) if groups[g] else 0.0 for g in group_names]
     group_sems = [_sem(np.asarray(groups[g], dtype=float)) for g in group_names]
 
-    # --- Plot
+    # --- Render
     import matplotlib
     matplotlib.use("Agg")
     from matplotlib.figure import Figure
@@ -524,9 +536,9 @@ def make_figure3_ac(
     dataA = [low_vals, high_vals]
     parts = axA.violinplot(dataA, showmeans=False, showmedians=True, showextrema=False)
     axA.set_xticks([1, 2])
-    axA.set_xticklabels(["Senescence-low", "Senescence-high"], rotation=0)
+    axA.set_xticklabels(["Set A", "Set B"], rotation=0)
     axA.set_ylabel(feature_col)
-    axA.set_title("Figure 3A")
+    axA.set_title("Feature distribution")
     axA.grid(True, axis="y", alpha=0.25)
 
     # Add simple n text
@@ -540,7 +552,7 @@ def make_figure3_ac(
     axC.set_xticklabels(group_names, rotation=45, ha="right")
     axC.set_ylim(0, 1)
     axC.set_ylabel("Fraction senescent")
-    axC.set_title("Figure 3C")
+    axC.set_title("Senescence burden")
     axC.grid(True, axis="y", alpha=0.25)
 
     # Small subtitle about burden mode
@@ -555,6 +567,93 @@ def make_figure3_ac(
     fig.tight_layout()
     out_png = Path(out_png)
     fig.savefig(str(out_png), dpi=300)
+
+
+# --- Output shipping helpers ---
+def _safe_stem(s: str) -> str:
+    s = str(s).strip()
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_ ")
+    return s or "run"
+
+
+def _cfg_to_dict(cfg: Config) -> dict:
+    return {k: getattr(cfg, k) for k in cfg.__dataclass_fields__.keys()}
+
+
+def _summarize_well(rows: list[dict]) -> dict:
+    n = int(len(rows))
+    out = {
+        "n_cells": n,
+        "frac_senescent": "",
+        "mean_cell_area_px": "",
+        "mean_lyso_area_px": "",
+        "mean_lyso_mean": "",
+        "mean_lyso_integrated": "",
+    }
+    if n == 0:
+        return out
+
+    def _mean(key: str):
+        vals = []
+        for r in rows:
+            try:
+                v = float(r.get(key, 0.0))
+                if np.isfinite(v):
+                    vals.append(v)
+            except Exception:
+                pass
+        return float(np.mean(vals)) if vals else ""
+
+    out["mean_cell_area_px"] = _mean("cell_area_px")
+    out["mean_lyso_area_px"] = _mean("lyso_area_px")
+    out["mean_lyso_mean"] = _mean("lyso_mean")
+    out["mean_lyso_integrated"] = _mean("lyso_integrated")
+
+    labels = []
+    for r in rows:
+        v = r.get("label_sen", "")
+        if v == "" or v is None:
+            continue
+        try:
+            labels.append(int(float(v)))
+        except Exception:
+            pass
+    if labels:
+        out["frac_senescent"] = float(np.mean(np.asarray(labels) > 0))
+
+    return out
+
+
+def _write_run_manifest(out_dir: Path, base: str, cfg: Config, inputs: dict, preview_scale: int, files_written: list[Path]):
+    from datetime import datetime
+    import json
+
+    manifest = {
+        "app": {"name": APP_NAME, "version": APP_VERSION},
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "inputs": inputs,
+        "preview_downsample_factor": int(preview_scale),
+        "config": _cfg_to_dict(cfg),
+        "outputs": [str(p.name) for p in files_written],
+    }
+
+    path = out_dir / f"{base}_run.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    return path
+
+
+def _maybe_zip_outputs(out_dir: Path, base: str, files_written: list[Path]) -> Path:
+    import zipfile
+
+    zpath = out_dir / f"{base}_outputs.zip"
+    with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for p in files_written:
+            if p.exists():
+                z.write(p, arcname=p.name)
+    return zpath
 
 
 def gui_main():
@@ -582,6 +681,7 @@ def gui_main():
         "lyso": None,
         "beta": None,
         "last_error": None,
+        "preview_scale": 1,
     }
 
     # ----------------------------
@@ -615,6 +715,8 @@ def gui_main():
     v_beta_thr_pct = tk.StringVar(value=str(cfg.beta_thr_pct))
     v_beta_min_area = tk.StringVar(value=str(cfg.beta_min_area))
     v_beta_close_radius = tk.StringVar(value=str(cfg.beta_close_radius))
+    v_zip_outputs = tk.BooleanVar(value=True)
+    v_qc_box = tk.StringVar(value="260")
 
     # Debounce preview updates
     _after_id = {"id": None}
@@ -642,8 +744,65 @@ def gui_main():
         c.beta_close_radius = int(float(v_beta_close_radius.get()))
         return c
 
-    def load_images():
-        """Load images from disk into state, harmonize shapes."""
+    def _compute_segmentation_for_current_state():
+        """Compute segmentation products for the currently loaded state images (already preview-downsampled if applicable)."""
+        if state.get("dapi") is None or state.get("lyso") is None:
+            return None
+        c = collect_cfg()
+        dapi = state["dapi"].astype(np.float32)
+        lyso = state["lyso"].astype(np.float32)
+
+        d01 = norm01(dapi, c.p_low, c.p_high)
+        l01 = norm01(lyso, c.p_low, c.p_high)
+
+        nuclei = segment_nuclei(d01, c)
+        cells = make_cell_masks(nuclei, l01, c, d01=d01)
+        lyso_bw = segment_lyso(l01, cells, c)
+
+        beta = state.get("beta")
+        beta_bw = None
+        beta_show = None
+        if beta is not None:
+            beta = beta.astype(np.float32)
+            beta_show = norm01(beta, float(c.beta_p_low), float(c.beta_p_high))
+            if bool(c.beta_invert):
+                beta_show = 1.0 - beta_show
+            beta_bw = segment_beta(beta, c)
+            beta_bw &= (cells > 0)
+
+        return {
+            "cfg": c,
+            "d01": d01,
+            "l01": l01,
+            "nuclei": nuclei,
+            "cells": cells,
+            "lyso_bw": lyso_bw,
+            "beta_bw": beta_bw,
+            "beta_show": beta_show,
+        }
+
+    def _cell_bbox_from_label(lbl: np.ndarray, cell_id: int):
+        ys, xs = np.nonzero(lbl == int(cell_id))
+        if ys.size == 0:
+            return None
+        y0, y1 = int(ys.min()), int(ys.max())
+        x0, x1 = int(xs.min()), int(xs.max())
+        return y0, x0, y1, x1
+
+    def _crop_center(img: np.ndarray, cy: int, cx: int, half: int):
+        h, w = img.shape
+        y0 = max(0, cy - half)
+        y1 = min(h, cy + half)
+        x0 = max(0, cx - half)
+        x1 = min(w, cx + half)
+        return img[y0:y1, x0:x1]
+
+    def load_images(for_preview: bool = True):
+        """Load images from disk into state, harmonize shapes.
+
+        For preview, large images are downsampled via stride slicing to keep the GUI responsive.
+        Saving outputs always uses full resolution.
+        """
         try:
             dapi_p = v_dapi.get().strip()
             lyso_p = v_lyso.get().strip()
@@ -660,11 +819,27 @@ def gui_main():
 
             d, l, b = harmonize_shapes(d, l, b)
 
+            scale = 1
+            if for_preview:
+                h, w = d.shape
+                max_dim = 3000
+                max_pixels = 20_000_000
+                scale_dim = int(np.ceil(max(h / max_dim, w / max_dim, 1.0)))
+                scale_pix = int(np.ceil(np.sqrt((h * w) / max_pixels))) if (h * w) > max_pixels else 1
+                scale = int(max(1, scale_dim, scale_pix))
+                if scale > 1:
+                    d = d[::scale, ::scale]
+                    l = l[::scale, ::scale]
+                    if b is not None:
+                        b = b[::scale, ::scale]
+
             state["dapi"], state["lyso"], state["beta"] = d, l, b
+            state["preview_scale"] = int(scale)
             state["last_error"] = None
         except Exception as e:
             state["last_error"] = str(e)
             state["dapi"], state["lyso"], state["beta"] = None, None, None
+            state["preview_scale"] = 1
 
     def schedule_update(*_):
         if _after_id["id"] is not None:
@@ -718,7 +893,7 @@ def gui_main():
 
     def update_preview():
         try:
-            load_images()
+            load_images(for_preview=True)
             if state["last_error"]:
                 status.set(state["last_error"])
                 for ax in (ax1, ax2, ax3, ax4, ax5, ax6):
@@ -729,33 +904,20 @@ def gui_main():
                 canvas.draw()
                 return
 
-            dapi = state["dapi"]
-            lyso = state["lyso"]
-            beta = state["beta"]
-            if dapi is None or lyso is None:
+            seg = _compute_segmentation_for_current_state()
+            if seg is None:
                 status.set("Select DAPI and Lyso images.")
                 return
 
-            c = collect_cfg()
-
-            d01 = norm01(dapi.astype(np.float32), c.p_low, c.p_high)
-            l01 = norm01(lyso.astype(np.float32), c.p_low, c.p_high)
-
-            nuclei = segment_nuclei(d01, c)
-            cells = make_cell_masks(nuclei, l01, c, d01=d01)
-            lyso_bw = segment_lyso(l01, cells, c)
-
-            beta_bw = None
-            beta_show = None
-            if beta is not None:
-                # Normalize Beta for display using its own percentiles
-                beta_show = norm01(beta.astype(np.float32), float(c.beta_p_low), float(c.beta_p_high))
-                if bool(c.beta_invert):
-                    beta_show = 1.0 - beta_show
-
-                beta_bw = segment_beta(beta.astype(np.float32), c)
-                # Constrain to cell pixels
-                beta_bw &= (cells > 0)
+            c = seg["cfg"]
+            d01 = seg["d01"]
+            l01 = seg["l01"]
+            nuclei = seg["nuclei"]
+            cells = seg["cells"]
+            lyso_bw = seg["lyso_bw"]
+            beta_bw = seg["beta_bw"]
+            beta_show = seg["beta_show"]
+            beta = state.get("beta")
 
             # Boundaries
             nuc_b = find_boundaries(nuclei, mode="outer")
@@ -797,11 +959,156 @@ def gui_main():
             # Simple QC text
             n_cells = int(cells.max())
             n_nuc = int(nuclei.max())
-            status.set(f"Nuclei: {n_nuc} | Cells: {n_cells} | Lyso pixels: {int(np.count_nonzero(lyso_bw))}")
+            scale = int(state.get("preview_scale", 1))
+            extra = f" | Preview: 1/{scale}x" if scale > 1 else ""
+            status.set(f"Nuclei: {n_nuc} | Cells: {n_cells} | Lyso pixels: {int(np.count_nonzero(lyso_bw))}{extra}")
 
             canvas.draw()
         except Exception as e:
             status.set(str(e))
+    def on_qc_viewer():
+        """Open a small QC window showing zoomed crops of random cells with overlays.
+
+        Uses the current preview arrays (may be downsampled), so it stays responsive.
+        Changing parameters in the main UI will automatically refresh these crops.
+        """
+        import random
+
+        win = tk.Toplevel(root)
+        win.title("QC cell zoom")
+        win.geometry("820x720")
+
+        top = ttk.Frame(win, padding=10)
+        top.pack(fill="x")
+
+        ttk.Label(top, text="Crop size (px):").pack(side="left")
+        ttk.Entry(top, textvariable=v_qc_box, width=8).pack(side="left", padx=(6, 14))
+
+        info = tk.StringVar(value="")
+        ttk.Label(top, textvariable=info).pack(side="left")
+
+        # Figure
+        qc_fig = Figure(figsize=(7.8, 6.4), dpi=110)
+        qc_axes = [
+            qc_fig.add_subplot(2, 2, 1),
+            qc_fig.add_subplot(2, 2, 2),
+            qc_fig.add_subplot(2, 2, 3),
+            qc_fig.add_subplot(2, 2, 4),
+        ]
+        for ax in qc_axes:
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        qc_canvas = FigureCanvasTkAgg(qc_fig, master=win)
+        qc_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        state_qc = {"cell_ids": []}
+
+        def _pick_cells(seg_dict):
+            cell_ids = np.unique(seg_dict["cells"])
+            cell_ids = cell_ids[cell_ids != 0]
+            cell_ids = [int(x) for x in cell_ids.tolist()]
+            if not cell_ids:
+                return []
+            k = min(4, len(cell_ids))
+            return random.sample(cell_ids, k=k)
+
+        def resample():
+            seg = _compute_segmentation_for_current_state()
+            if seg is None:
+                state_qc["cell_ids"] = []
+                draw()
+                return
+            state_qc["cell_ids"] = _pick_cells(seg)
+            draw()
+
+        ttk.Button(top, text="Resample cells", command=resample).pack(side="right")
+
+        def draw():
+            seg = _compute_segmentation_for_current_state()
+            if seg is None:
+                info.set("No images loaded")
+                for ax in qc_axes:
+                    ax.cla()
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+                    ax.text(0.5, 0.5, "Load images", ha="center", va="center")
+                qc_canvas.draw()
+                return
+
+            cells = seg["cells"]
+            nuclei = seg["nuclei"]
+            d01 = seg["d01"]
+            l01 = seg["l01"]
+            lyso_bw = seg["lyso_bw"]
+
+            try:
+                box = int(float(v_qc_box.get()))
+            except Exception:
+                box = 260
+            box = int(max(120, min(900, box)))
+            half = box // 2
+
+            # Ensure we have 4 cell IDs
+            ids = state_qc.get("cell_ids") or []
+            # If ids are missing or no longer present, resample
+            if len(ids) == 0 or any(_cell_bbox_from_label(cells, cid) is None for cid in ids):
+                ids = _pick_cells(seg)
+                state_qc["cell_ids"] = ids
+
+            info.set(f"Showing {len(ids)} cells | Total cells: {int(cells.max())} | Total nuclei: {int(nuclei.max())}")
+
+            for ax_i, ax in enumerate(qc_axes):
+                ax.cla()
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+                if ax_i >= len(ids):
+                    ax.text(0.5, 0.5, "(empty)", ha="center", va="center")
+                    continue
+
+                cid = int(ids[ax_i])
+                bb = _cell_bbox_from_label(cells, cid)
+                if bb is None:
+                    ax.text(0.5, 0.5, f"cell {cid} missing", ha="center", va="center")
+                    continue
+
+                y0, x0, y1, x1 = bb
+                cy = int((y0 + y1) / 2)
+                cx = int((x0 + x1) / 2)
+
+                l_crop = _crop_center(l01, cy, cx, half)
+                d_crop = _crop_center(d01, cy, cx, half)
+                c_crop = _crop_center(cells, cy, cx, half)
+                n_crop = _crop_center(nuclei, cy, cx, half)
+                ly_crop = _crop_center(lyso_bw.astype(np.uint8), cy, cx, half)
+
+                # Boundaries for overlays
+                cb = find_boundaries(c_crop, mode="outer")
+                nb = find_boundaries(n_crop, mode="outer")
+
+                ax.set_title(f"cell_id={cid}")
+                ax.imshow(l_crop, cmap="gray")
+                ax.imshow(cb.astype(float), alpha=0.85)
+                ax.imshow(nb.astype(float), alpha=0.65)
+                ax.imshow(ly_crop.astype(float), alpha=0.25)
+
+            qc_fig.tight_layout()
+            qc_canvas.draw()
+
+        # Initial pick and draw
+        resample()
+
+        # Keep QC window refreshed when parameters change
+        def _tick_refresh():
+            try:
+                if win.winfo_exists():
+                    draw()
+                    win.after(350, _tick_refresh)
+            except Exception:
+                pass
+
+        win.after(350, _tick_refresh)
 
     # ----------------------------
     # Layout
@@ -923,7 +1230,7 @@ def gui_main():
         schedule_update()
 
     def on_save():
-        load_images()
+        load_images(for_preview=False)
         if state["last_error"]:
             messagebox.showerror("Error", state["last_error"])
             return
@@ -936,6 +1243,7 @@ def gui_main():
             return
 
         try:
+            from datetime import datetime
             c = collect_cfg()
             d01 = norm01(state["dapi"].astype(np.float32), c.p_low, c.p_high)
             l01 = norm01(state["lyso"].astype(np.float32), c.p_low, c.p_high)
@@ -951,11 +1259,17 @@ def gui_main():
             rows = compute_cell_table(cells, l01, lyso_bw, beta_bw, c)
 
             out_dir = Path(out_dir)
-            base = "sentracklite"
+
+            stem = _safe_stem(Path(v_dapi.get().strip()).stem if v_dapi.get().strip() else "sentracklite")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = f"{stem}_{ts}"
+
+            files_written: list[Path] = []
 
             # Save figure
             fig_path = out_dir / f"{base}_preview.png"
             fig.savefig(fig_path, dpi=300)
+            files_written.append(fig_path)
 
             # Save masks
             tiff_cells = out_dir / f"{base}_cells.tif"
@@ -966,33 +1280,82 @@ def gui_main():
             tiff.imwrite(str(tiff_cells), cells.astype(np.int32))
             tiff.imwrite(str(tiff_nuc), nuclei.astype(np.int32))
             tiff.imwrite(str(tiff_lyso), lyso_bw.astype(np.uint8) * 255)
+            files_written.append(tiff_cells)
+            files_written.append(tiff_nuc)
+            files_written.append(tiff_lyso)
             if beta_bw is not None:
                 tiff.imwrite(str(tiff_beta), beta_bw.astype(np.uint8) * 255)
+                files_written.append(tiff_beta)
 
             # Save CSV
             csv_path = out_dir / f"{base}_per_cell.csv"
             import csv
+            fieldnames = [
+                "cell_id",
+                "cell_area_px",
+                "lyso_area_px",
+                "lyso_mean",
+                "lyso_integrated",
+                "beta_overlap_frac",
+                "label_sen",
+            ]
+            if rows:
+                fieldnames = list(rows[0].keys())
             with open(csv_path, "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [
-                    "cell_id","cell_area_px","lyso_area_px","lyso_mean","lyso_integrated","beta_overlap_frac","label_sen"
-                ])
+                w = csv.DictWriter(f, fieldnames=fieldnames)
                 w.writeheader()
                 for r0 in rows:
                     w.writerow(r0)
+            files_written.append(csv_path)
 
-            messagebox.showinfo(
-                "Saved",
-                f"Saved:\n{fig_path}\n{tiff_cells}\n{csv_path}",
+            summ = _summarize_well(rows)
+            summ_path = out_dir / f"{base}_summary.csv"
+            with open(summ_path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(summ.keys()))
+                w.writeheader()
+                w.writerow(summ)
+            files_written.append(summ_path)
+
+            inputs = {
+                "dapi": v_dapi.get().strip(),
+                "lyso": v_lyso.get().strip(),
+                "beta": v_beta.get().strip(),
+                "plane_index": int(float(v_plane.get())),
+            }
+            manifest_path = _write_run_manifest(
+                out_dir=out_dir,
+                base=base,
+                cfg=c,
+                inputs=inputs,
+                preview_scale=int(state.get("preview_scale", 1)),
+                files_written=files_written,
             )
+            files_written.append(manifest_path)
+
+            zip_path = None
+            if bool(v_zip_outputs.get()):
+                zip_path = _maybe_zip_outputs(out_dir, base, files_written)
+
+            msg_lines = [
+                f"Preview: {fig_path}",
+                f"Cells mask: {tiff_cells}",
+                f"Per-cell CSV: {csv_path}",
+                f"Summary CSV: {summ_path}",
+                f"Run manifest: {manifest_path}",
+            ]
+            if zip_path is not None:
+                msg_lines.append(f"ZIP: {zip_path}")
+            messagebox.showinfo("Saved", "Saved:\n" + "\n".join(msg_lines))
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
     ttk.Button(frm_btn, text="Refresh preview", command=on_refresh).pack(fill="x", pady=(0, 6))
     ttk.Button(frm_btn, text="Save outputs", command=on_save).pack(fill="x", pady=(0, 6))
+    ttk.Checkbutton(frm_btn, text="Zip outputs", variable=v_zip_outputs).pack(anchor="w", pady=(0, 6))
 
-    def on_make_fig3():
+    def on_assist_plots():
         win = tk.Toplevel(root)
-        win.title("Make Figure 3 (Panels A and C)")
+        win.title("Assist plots")
         win.geometry("560x260")
 
         v_low = tk.StringVar(value="")
@@ -1012,7 +1375,7 @@ def gui_main():
 
         def pick_save_png(var: tk.StringVar):
             p = filedialog.asksaveasfilename(
-                title="Save Figure 3 PNG",
+                title="Save plots PNG",
                 defaultextension=".png",
                 filetypes=[("PNG", "*.png")],
             )
@@ -1020,19 +1383,19 @@ def gui_main():
                 var.set(p)
 
         r = 0
-        ttk.Label(frm, text="Folder (Panel A): senescence-low per-cell CSVs").grid(row=r, column=0, sticky="w")
+        ttk.Label(frm, text="Folder A: per-cell CSVs").grid(row=r, column=0, sticky="w")
         r += 1
         ttk.Entry(frm, textvariable=v_low, width=60).grid(row=r, column=0, sticky="we")
         ttk.Button(frm, text="Browse", command=lambda: pick_dir(v_low)).grid(row=r, column=1, padx=(6, 0))
         r += 1
 
-        ttk.Label(frm, text="Folder (Panel A): senescence-high per-cell CSVs").grid(row=r, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(frm, text="Folder B: per-cell CSVs").grid(row=r, column=0, sticky="w", pady=(8, 0))
         r += 1
         ttk.Entry(frm, textvariable=v_high, width=60).grid(row=r, column=0, sticky="we")
         ttk.Button(frm, text="Browse", command=lambda: pick_dir(v_high)).grid(row=r, column=1, padx=(6, 0))
         r += 1
 
-        ttk.Label(frm, text="Folder (Panel C): plate per-well per-cell CSVs").grid(row=r, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(frm, text="Plate folder: per-well per-cell CSVs").grid(row=r, column=0, sticky="w", pady=(8, 0))
         r += 1
         ttk.Entry(frm, textvariable=v_plate, width=60).grid(row=r, column=0, sticky="we")
         ttk.Button(frm, text="Browse", command=lambda: pick_dir(v_plate)).grid(row=r, column=1, padx=(6, 0))
@@ -1063,22 +1426,20 @@ def gui_main():
             try:
                 if not v_out.get().strip():
                     raise ValueError("Choose an output PNG path.")
-                make_figure3_ac(
+                make_assist_plots(
                     out_png=Path(v_out.get().strip()),
-                    low_folder=Path(v_low.get().strip()),
-                    high_folder=Path(v_high.get().strip()),
+                    folder_a=Path(v_low.get().strip()),
+                    folder_b=Path(v_high.get().strip()),
                     plate_folder=Path(v_plate.get().strip()),
                     feature_col=v_feat.get().strip(),
                     burden_mode=v_mode.get().strip(),
                     prob_threshold=float(v_thr.get()),
                 )
-                messagebox.showinfo("Saved", f"Saved Figure 3 (A,C) to:\n{v_out.get().strip()}")
+                messagebox.showinfo("Saved", f"Saved plots to:\n{v_out.get().strip()}")
             except Exception as e:
                 messagebox.showerror("Error", str(e))
 
-        ttk.Button(frm, text="Generate Figure 3 (A,C)", command=run_make).grid(row=r + 1, column=0, columnspan=2, sticky="we", pady=(12, 0))
-
-    ttk.Button(frm_btn, text="Make Figure 3 (A,C)", command=on_make_fig3).pack(fill="x")
+        ttk.Button(frm, text="Generate plots", command=run_make).grid(row=r + 1, column=0, columnspan=2, sticky="we", pady=(12, 0))
 
     # Right: preview canvas and status
 
@@ -1095,6 +1456,34 @@ def gui_main():
 
     for var in (v_fg_from_lyso, v_beta_invert):
         var.trace_add("write", schedule_update)
+
+    # Small bottom-right affordance for optional plotting tools (kept out of the main workflow)
+    assist_canvas = tk.Canvas(root, width=140, height=34, highlightthickness=0, bd=0)
+    assist_canvas.place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-10)
+
+    assist_canvas.create_oval(4, 6, 24, 26, fill="#dddddd", outline="#888888")
+    assist_canvas.create_text(30, 16, text="Figure assist mode", anchor="w", font=("TkDefaultFont", 9))
+
+    def _open_assist(_evt=None):
+        on_assist_plots()
+
+    assist_canvas.bind("<Button-1>", _open_assist)
+    assist_canvas.bind("<Enter>", lambda _e: assist_canvas.configure(cursor="hand2"))
+    assist_canvas.bind("<Leave>", lambda _e: assist_canvas.configure(cursor=""))
+
+    # Small bottom-left affordance for QC zoom (random cells)
+    qc_canvas_btn = tk.Canvas(root, width=130, height=34, highlightthickness=0, bd=0)
+    qc_canvas_btn.place(relx=1.0, rely=1.0, anchor="se", x=-160, y=-10)
+
+    qc_canvas_btn.create_oval(4, 6, 24, 26, fill="#dddddd", outline="#888888")
+    qc_canvas_btn.create_text(30, 16, text="QC zoom", anchor="w", font=("TkDefaultFont", 9))
+
+    def _open_qc(_evt=None):
+        on_qc_viewer()
+
+    qc_canvas_btn.bind("<Button-1>", _open_qc)
+    qc_canvas_btn.bind("<Enter>", lambda _e: qc_canvas_btn.configure(cursor="hand2"))
+    qc_canvas_btn.bind("<Leave>", lambda _e: qc_canvas_btn.configure(cursor=""))
 
     # Initial draw
     schedule_update()
